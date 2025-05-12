@@ -2,6 +2,12 @@ import cv2
 import numpy as np
 import math 
 import random 
+import torch 
+import torch.nn as nn
+from torchvision import models 
+from PIL import Image 
+from torch.utils.data import Dataset
+import os 
 
 def noise_image(number_coords, colors, hour, minute, image, image_size, 
                 font=cv2.FONT_HERSHEY_SIMPLEX, font_scale=0.5, font_thickness=1,
@@ -58,12 +64,13 @@ def noise_image(number_coords, colors, hour, minute, image, image_size,
 
         
 
-def resize_clock(image, clock_box, scale_range=(0.3, 0.9)):
+def resize_clock(image, clock_box, bg_color, colors, scale_range=(0.3, 0.9)):
     """
     Resize the clock region and paste it back centered at original clock center.
     image: numpy.ndarray (OpenCV BGR)
     clock_box: ((x_min, y_min), (x_max, y_max))
     """
+    # Image Size 설정
     img_h, img_w = image.shape[:2]
     (x_min, y_min), (x_max, y_max) = clock_box
     clock_crop = image[y_min:y_max, x_min:x_max].copy()
@@ -82,7 +89,7 @@ def resize_clock(image, clock_box, scale_range=(0.3, 0.9)):
     new_y_max = new_y_min + target_size
 
     # 원래 위치 제거 (선택적)
-    image[y_min:y_max, x_min:x_max] = 0
+    image[y_min:y_max, x_min:x_max] = colors[bg_color]
 
     # 새로운 위치에 삽입
     image[new_y_min:new_y_max, new_x_min:new_x_max] = resized_clock
@@ -92,6 +99,10 @@ def resize_clock(image, clock_box, scale_range=(0.3, 0.9)):
 # Now, we draw the "dynamic" information:
 
 def draw_clock(hour, minute, number_coords, colors, image_size, rectangle_size, center=None):
+    # 
+    hour_length = (193-33) * 0.25
+    minute_length = (193-33) * 0.425
+
     # 1. 캔버스 생성
     image = np.zeros(image_size, dtype=np.uint8)
     color = random.choice([k for k, v in colors.items() if k != 'black'])
@@ -110,29 +121,29 @@ def draw_clock(hour, minute, number_coords, colors, image_size, rectangle_size, 
 
     # 4. 숫자 표시
     for i in range(1, 13):
-        cv2.putText(image, f"{i}", number_coords[i], 1, 0.5, colors['black'], 1, cv2.LINE_AA)
+        cv2.putText(image, f"{i}", number_coords[i], cv2.FONT_HERSHEY_SIMPLEX, 0.5, colors['black'], 1, cv2.LINE_AA)
 
     # 5. 각도 및 바늘
     minute_angle = math.radians((minute * 6 + 270) % 360)
     hour_angle = math.radians((hour * 30 + minute * 0.5 + 270) % 360)
 
     cv2.line(image, center,
-             (round(center[0] + 60 * math.cos(minute_angle)),
-              round(center[1] + 60 * math.sin(minute_angle))),
-             colors['black'], 5)
+             (round(center[0] + minute_length * math.cos(minute_angle)),
+              round(center[1] + minute_length * math.sin(minute_angle))),
+             colors['black'], 3)
     
     cv2.line(image, center,
-             (round(center[0] + 40 * math.cos(hour_angle)),
-              round(center[1] + 40 * math.sin(hour_angle))),
-             colors['black'], 10)
+             (round(center[0] + hour_length * math.cos(hour_angle)),
+              round(center[1] + hour_length * math.sin(hour_angle))),
+             colors['black'], 5)
 
     # 중심 원
     cv2.circle(image, center, 10, colors['dark_gray'], -1)
     cv2.imshow("Original Clock", image)
 
-    return image
+    return image, color
 
-def translate_clock(image, clock_box, shift_range=(0.25, 0.5)):
+def translate_clock(image, bg_color, clock_box, colors,shift_range=(0.25, 0.5)):
     """
     image: numpy.ndarray (OpenCV 이미지, BGR)
     clock_box: ((x_min, y_min), (x_max, y_max)) 형태의 튜플
@@ -168,7 +179,48 @@ def translate_clock(image, clock_box, shift_range=(0.25, 0.5)):
     clock_crop = image[y_min:y_max, x_min:x_max].copy()
 
     # 시계 붙여넣기 (기존 위치는 0으로 지우고 싶다면 아래 줄 추가 가능)
-    image[y_min:y_max, x_min:x_max] = 0
+    image[y_min:y_max, x_min:x_max] = colors[bg_color]
     image[new_y_min:new_y_max, new_x_min:new_x_max] = clock_crop
 
     return image
+
+def parse_time(filepath):
+    basename = os.path.basename(filepath)
+    name, _ = os.path.splitext(basename)
+    _, _, hour_str, minute_str, _ = name.split('_')
+
+    return int(hour_str), int(minute_str)
+
+class ClockDataset(Dataset):
+    def __init__(self, image_paths, transform = None):
+        self.image_paths = image_paths
+        self.transform = transform
+    
+    def __len__(self):
+        return len(self.image_paths)
+    
+    def __getitem__(self, idx):
+        img_path = self.image_paths[idx]
+        image = Image.open(img_path).convert('RGB')
+        if self.transform:
+            image = self.transform(image)
+        hour, minute = parse_time(img_path)
+        return image, torch.tensor([hour, minute])
+    
+class TwoHeadResNet(nn.Module):
+    def __init__(self, num_hour_class=12 , num_minute_class=60, pretrained=True):
+        super().__init__()
+        # ResNet18의 BackBone
+        self.backbone = models.resnet18(weights='IMAGENET1K_V1' if pretrained else None)
+        num_ftrs = self.backbone.fc.in_features
+        self.backbone.fc = nn.Identity()
+
+        # 분기된 FCN
+        self.fc_hour = nn.Linear(num_ftrs, num_hour_class)
+        self.fc_minute = nn.Linear(num_ftrs, num_minute_class)
+
+    def forward(self, x):
+        features = self.backbone(x)
+        hour_logits = self.fc_hour(features)
+        minute_logits = self.fc_minute(features)
+        return hour_logits, minute_logits
